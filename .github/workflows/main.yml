@@ -1,0 +1,74 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_APP: ${{ env.REGISTRY }}/${{ github.repository_owner }}/myapp
+  IMAGE_MIDDLEWARE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/middleware
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build and push app
+        uses: docker/build-push-action@v4
+        with:
+          context: ./app
+          push: true
+          tags: ${{ env.IMAGE_APP }}:${{ github.sha }}
+
+      - name: Build and push middleware
+        uses: docker/build-push-action@v4
+        with:
+          context: ./middleware
+          push: true
+          tags: ${{ env.IMAGE_MIDDLEWARE }}:${{ github.sha }}
+
+      - name: Set outputs
+        run: |
+          echo "app_image=${{ env.IMAGE_APP }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "middleware_image=${{ env.IMAGE_MIDDLEWARE }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: build-and-push
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR (runner)
+        run: echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ secrets.GHCR_USERNAME }} --password-stdin
+
+      - name: Pull images on runner
+        run: |
+          docker pull ${{ needs.build-and-push.outputs.app_image }}
+          docker pull ${{ needs.build-and-push.outputs.middleware_image }}
+
+      - name: Load images into minikube
+        run: |
+          minikube image load ${{ needs.build-and-push.outputs.app_image }}
+          minikube image load ${{ needs.build-and-push.outputs.middleware_image }}
+
+      - name: Update deployments
+        run: |
+          kubectl set image deployment/app-deployment my-app=${{ needs.build-and-push.outputs.app_image }} || kubectl apply -f k8s/app-deployment.yaml
+          kubectl set image deployment/middleware-deployment middleware=${{ needs.build-and-push.outputs.middleware_image }} || kubectl apply -f k8s/middleware-deployment.yaml
+          kubectl rollout status deployment/app-deployment
+          kubectl rollout status deployment/middleware-deployment
